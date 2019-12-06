@@ -372,6 +372,7 @@ struct joycon_ctlr {
 
 	/* imu */
 	struct input_dev *imu_input;
+	u8 player_id;
 };
 
 static int __joycon_hid_send(struct hid_device *hdev, u8 *data, size_t len)
@@ -499,6 +500,34 @@ static int joycon_send_subcmd(struct joycon_ctlr *ctlr,
 	return ret;
 }
 
+static DEFINE_MUTEX(joycon_input_num_mutex);
+static void joycon_reset_player_id(struct joycon_ctlr *ctlr) {
+	static u8 connected_ctlrs = 0;
+	u8 input_num = 0;
+	hid_dbg(ctlr->hdev, "Starting reset player led. Connected controllers: 0x%X\n", connected_ctlrs);
+	mutex_lock(&joycon_input_num_mutex);
+	if (ctlr->player_id == 0x0) {
+		hid_dbg(ctlr->hdev, "Connecting new controller\n");
+		/* Looks for first empty slot and marks it as taken */
+        while (((connected_ctlrs >> input_num) & 1) && input_num < 4) {
+            ++input_num;
+        }
+        connected_ctlrs |= 1 << input_num; // mark slot as connected
+        ctlr->player_id = 0xF >> (4-(input_num+1)); // set player id
+	}
+	else {
+		hid_dbg(ctlr->hdev, "Disconnecting controller with id 0x%X\n", ctlr->player_id);
+        /* find corresponding slot to given player id*/
+        while((ctlr->player_id != 0xF >> (4-(input_num+1))) && input_num < 4) {
+            ++input_num;
+        }
+        /* clear slot */
+        connected_ctlrs &= ~(1 << input_num);
+	}
+	hid_dbg(ctlr->hdev, "Finished reset player led. connected controllers: 0x%X\n", connected_ctlrs);
+	mutex_unlock(&joycon_input_num_mutex);
+}
+
 /* Supply nibbles for flash and on. Ones correspond to active */
 static int joycon_set_player_leds(struct joycon_ctlr *ctlr, u8 flash, u8 on)
 {
@@ -507,7 +536,7 @@ static int joycon_set_player_leds(struct joycon_ctlr *ctlr, u8 flash, u8 on)
 
 	req = (struct joycon_subcmd_request *)buffer;
 	req->subcmd_id = JC_SUBCMD_SET_PLAYER_LIGHTS;
-	req->data[0] = (flash << 4) | on;
+	req->data[0] = 1 << 4 | ctlr->player_id;
 
 	hid_dbg(ctlr->hdev, "setting player leds\n");
 	return joycon_send_subcmd(ctlr, req, 1, HZ/4);
@@ -1098,6 +1127,8 @@ static int joycon_player_led_brightness_set(struct led_classdev *led,
 	int ret;
 	int num;
 
+	hid_dbg(hdev, "call joycon_player_led_brightness_set\n");
+
 	ctlr = hid_get_drvdata(hdev);
 	if (!ctlr) {
 		hid_err(hdev, "No controller data\n");
@@ -1107,7 +1138,7 @@ static int joycon_player_led_brightness_set(struct led_classdev *led,
 	/* determine which player led this is */
 	for (num = 0; num < JC_NUM_LEDS; num++) {
 		if (&ctlr->leds[num] == led)
-			break;
+			break; 
 	}
 	if (num >= JC_NUM_LEDS)
 		return -EINVAL;
@@ -1166,7 +1197,6 @@ static const char * const joycon_player_led_names[] = {
 	"player4"
 };
 
-static DEFINE_MUTEX(joycon_input_num_mutex);
 static int joycon_leds_create(struct joycon_ctlr *ctlr)
 {
 	struct hid_device *hdev = ctlr->hdev;
@@ -1176,12 +1206,11 @@ static int joycon_leds_create(struct joycon_ctlr *ctlr)
 	char *name;
 	int ret = 0;
 	int i;
-	static int input_num = 1;
 
 	/* Set the default controller player leds based on controller number */
-	mutex_lock(&joycon_input_num_mutex);
 	mutex_lock(&ctlr->output_mutex);
-	ret = joycon_set_player_leds(ctlr, 0, 0xF >> (4 - input_num));
+	joycon_reset_player_id(ctlr);
+	ret = joycon_set_player_leds(ctlr, 0, 0);
 	if (ret)
 		hid_warn(ctlr->hdev, "Failed to set leds; ret=%d\n", ret);
 	mutex_unlock(&ctlr->output_mutex);
@@ -1195,7 +1224,7 @@ static int joycon_leds_create(struct joycon_ctlr *ctlr)
 
 		led = &ctlr->leds[i];
 		led->name = name;
-		led->brightness = ((i + 1) <= input_num) ? LED_ON : LED_OFF;
+		led->brightness = (ctlr->player_id > 0) ? LED_ON : LED_OFF;
 		led->max_brightness = LED_ON;
 		led->brightness_set_blocking =
 					joycon_player_led_brightness_set;
@@ -1207,10 +1236,6 @@ static int joycon_leds_create(struct joycon_ctlr *ctlr)
 			return ret;
 		}
 	}
-
-	if (++input_num > 4)
-		input_num = 1;
-	mutex_unlock(&joycon_input_num_mutex);
 
 	/* configure the home LED */
 	if (ctlr->hdev->product != USB_DEVICE_ID_NINTENDO_JOYCONL) {
@@ -1598,6 +1623,8 @@ static void nintendo_hid_remove(struct hid_device *hdev)
 	unsigned long flags;
 
 	hid_dbg(hdev, "remove\n");
+
+	joycon_reset_player_id(ctlr);
 
 	/* Prevent further attempts at sending subcommands. */
 	spin_lock_irqsave(&ctlr->lock, flags);
